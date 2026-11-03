@@ -35,9 +35,9 @@ class MongoConfig:
 class SarvamConfig:
     api_key: Optional[str] = field(default_factory=lambda: os.getenv("SARVAM_API_KEY"))
     api_base_url: str = field(
-        default_factory=lambda: os.getenv("SARVAM_API_BASE_URL", "https://api.sarvam.ai/v1")
+        default_factory=lambda: os.getenv("SARVAM_API_BASE_URL", "https://api.sarvam.ai/v2")
     )
-    model: str = field(default_factory=lambda: os.getenv("SARVAM_MODEL", "sarvam-m"))
+    model: str = field(default_factory=lambda: os.getenv("SARVAM_MODEL", "sarvam-105b"))
     timeout_seconds: int = 60
     max_retries: int = 2
 

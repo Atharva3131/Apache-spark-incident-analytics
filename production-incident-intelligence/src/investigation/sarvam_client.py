@@ -1,8 +1,11 @@
 """
 Sarvam AI integration layer.
 
-Sends structured incident data to Sarvam's chat completions API and validates
+Sends structured incident data to Sarvam's chat completions V2 API and validates
 the response using Pydantic models.
+
+Uses the `api-subscription-key` header for authentication and requests JSON output
+with `response_format: {"type": "json_object"}`.
 
 If the API key is missing, credentials fail, or the API is unavailable,
 this module gracefully falls back to the deterministic RCA engine.
@@ -133,13 +136,14 @@ Respond ONLY with the JSON object, no other text."""
 
     def _call_api(self, prompt: str) -> Optional[dict]:
         """
-        Call the Sarvam chat completions endpoint.
+        Call the Sarvam chat completions V2 endpoint.
 
         Returns the parsed response dict, or None if the call fails.
+        Uses api-subscription-key header for authentication and requests JSON output.
         """
         url = f"{self._config.api_base_url}/chat/completions"
         headers = {
-            "Authorization": f"Bearer {self._config.api_key}",
+            "api-subscription-key": self._config.api_key,
             "Content-Type": "application/json",
         }
         payload = {
@@ -149,10 +153,11 @@ Respond ONLY with the JSON object, no other text."""
             ],
             "temperature": 0.3,
             "max_tokens": 2000,
+            "response_format": {"type": "json_object"},
         }
 
         try:
-            logger.info("Calling Sarvam API – model: %s", self._config.model)
+            logger.info("Calling Sarvam V2 API – model: %s, endpoint: %s", self._config.model, url)
             response = requests.post(
                 url,
                 json=payload,
