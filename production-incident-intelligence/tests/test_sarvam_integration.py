@@ -314,8 +314,8 @@ class TestSarvamIntegration:
         assert result is None
 
     @patch("src.investigation.sarvam_client.requests.post")
-    def test_sarvam_finish_reason_length_token_budget(self, mock_post, investigator):
-        """Test that finish_reason='length' indicates token budget exceeded."""
+    def test_sarvam_finish_reason_length_token_budget_fallback(self, mock_post, investigator):
+        """Test that finish_reason='length' triggers controlled fallback (returns None, logs warning)."""
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "model": "sarvam-105b",
@@ -340,8 +340,8 @@ class TestSarvamIntegration:
             ],
             "usage": {
                 "prompt_tokens": 1000,
-                "completion_tokens": 3096,
-                "total_tokens": 4096
+                "completion_tokens": 2048,
+                "total_tokens": 3048
             }
         }
         mock_post.return_value = mock_response
@@ -353,6 +353,7 @@ class TestSarvamIntegration:
             probable_root_cause="Test",
         )
 
+        # Should return None and let dashboard fall back to deterministic RCA
         assert result is None
 
     @patch("src.investigation.sarvam_client.requests.post")
@@ -381,8 +382,8 @@ class TestSarvamIntegration:
         assert result is None
 
     @patch("src.investigation.sarvam_client.requests.post")
-    def test_sarvam_max_tokens_4096(self, mock_post, investigator):
-        """Test that max_tokens is 4096."""
+    def test_sarvam_max_tokens_2048(self, mock_post, investigator):
+        """Test that max_tokens is optimized to 2048 for concise RCA."""
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "choices": [
@@ -393,10 +394,12 @@ class TestSarvamIntegration:
                             "severity": "MEDIUM",
                             "summary": "Test",
                             "probable_root_cause": "Test",
+                            "root_cause_reasoning": "Reasoning",
                             "supporting_evidence": [],
                             "affected_services": [],
-                            "timeline": [],
+                            "failure_propagation": "Chain",
                             "recommended_actions": [],
+                            "confidence": "HIGH",
                             "uncertainties": [],
                         })
                     }
@@ -410,7 +413,7 @@ class TestSarvamIntegration:
         call_kwargs = mock_post.call_args[1]
         payload = call_kwargs["json"]
 
-        assert payload["max_tokens"] == 4096
+        assert payload["max_tokens"] == 2048
 
     @patch("src.investigation.sarvam_client.requests.post")
     def test_sarvam_reasoning_content_not_in_response(self, mock_post, investigator):
@@ -457,3 +460,236 @@ class TestSarvamIntegration:
         assert result is not None
         assert result.incident_title == "Final Response"
         assert result.summary == "Actual response"
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_optimized_concise_response(self, mock_post, investigator):
+        """Test that optimized Sarvam response with confidence and reasoning is parsed correctly."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "model": "sarvam-105b",
+            "id": "test-optimized",
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({
+                            "incident_title": "Database Connection Pool Exhaustion",
+                            "severity": "CRITICAL",
+                            "summary": "Database connection pool exhausted due to long-running queries.",
+                            "probable_root_cause": "Unoptimized query in inventory-service",
+                            "root_cause_reasoning": "Query took 45s average, blocking 95% of connections.",
+                            "supporting_evidence": [
+                                "Avg query latency: 45000ms",
+                                "Connection errors: 2000/min",
+                                "Error rate in inventory-service: 95%"
+                            ],
+                            "affected_services": ["inventory-service", "order-service", "api-gateway"],
+                            "failure_propagation": "inventory-service blocked → order-service timeouts → api-gateway failures",
+                            "recommended_actions": [
+                                "Optimize inventory query or add query timeout",
+                                "Increase database connection pool size",
+                                "Implement circuit breaker in order-service"
+                            ],
+                            "confidence": "HIGH",
+                            "uncertainties": []
+                        })
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 400,
+                "completion_tokens": 350,
+                "total_tokens": 750
+            }
+        }
+        mock_post.return_value = mock_response
+
+        result = investigator.investigate(
+            incident_summary="Database connection errors in production",
+            affected_services=["inventory-service", "order-service", "api-gateway"],
+            error_evidence=[
+                "Avg query latency: 45000ms",
+                "Connection errors: 2000/min",
+                "Error rate: 95%"
+            ],
+            probable_root_cause="Unoptimized query",
+            scenario_hint="db_exhaustion"
+        )
+
+        assert result is not None
+        assert result.incident_title == "Database Connection Pool Exhaustion"
+        assert result.severity == Severity.CRITICAL
+        # Verify propagation chain is captured in uncertainties
+        assert any("inventory-service" in u for u in result.uncertainties)
+        assert len(result.affected_services) == 3
+        # Verify summary is concise and to the point
+        assert "pool" in result.summary.lower()
+        assert len(result.summary) < 200  # Should be concise
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_evidence_limited_to_top_5(self, mock_post, investigator):
+        """Test that prompt limits evidence to top 5 findings."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps({
+                "incident_title": "Test",
+                "severity": "MEDIUM",
+                "summary": "Test",
+                "probable_root_cause": "Test",
+                "supporting_evidence": [],
+                "affected_services": [],
+                "failure_propagation": "",
+                "recommended_actions": [],
+                "confidence": "MEDIUM",
+                "uncertainties": []
+            })}}]
+        }
+        mock_post.return_value = mock_response
+
+        # Pass 10 evidence items
+        many_evidence = [f"Evidence {i}" for i in range(10)]
+        
+        investigator.investigate(
+            incident_summary="Test",
+            affected_services=[],
+            error_evidence=many_evidence,
+            probable_root_cause="Test"
+        )
+
+        call_kwargs = mock_post.call_args[1]
+        payload = call_kwargs["json"]
+        prompt = payload["messages"][0]["content"]
+
+        # Verify prompt contains only first 5 evidence items
+        for i in range(5):
+            assert f"Evidence {i}" in prompt
+        # Verify evidence beyond index 5 is NOT in prompt
+        for i in range(5, 10):
+            assert f"Evidence {i}" not in prompt
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_prompt_is_concise(self, mock_post, investigator):
+        """Test that optimized prompt is concise and doesn't include raw logs."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": json.dumps({
+                "incident_title": "Test",
+                "severity": "MEDIUM",
+                "summary": "Test",
+                "probable_root_cause": "Test",
+                "supporting_evidence": [],
+                "affected_services": [],
+                "failure_propagation": "",
+                "recommended_actions": [],
+                "confidence": "MEDIUM",
+                "uncertainties": []
+            })}}]
+        }
+        mock_post.return_value = mock_response
+
+        investigator.investigate(
+            incident_summary="Test incident",
+            affected_services=["svc1", "svc2"],
+            error_evidence=["Error 1"],
+            probable_root_cause="Root cause",
+            scenario_hint="test_scenario"
+        )
+
+        call_kwargs = mock_post.call_args[1]
+        payload = call_kwargs["json"]
+        prompt = payload["messages"][0]["content"]
+
+        # Verify concise prompt structure
+        assert "INCIDENT:" in prompt
+        assert "SERVICES:" in prompt
+        assert "ROOT CAUSE (from correlation):" in prompt
+        assert "KEY EVIDENCE (top 5 findings):" in prompt
+        
+        # Verify it requires concise output
+        assert "brief" in prompt.lower() or "concise" in prompt.lower()
+        
+        # Verify word limit constraint
+        assert "<500 words" in prompt or "concise" in prompt.lower()
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_malformed_json_with_fallback_signal(self, mock_post, investigator):
+        """Test that malformed JSON is detected and None is returned for fallback."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "{ malformed json, missing quotes }"
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        }
+        mock_post.return_value = mock_response
+
+        result = investigator.investigate(
+            incident_summary="Test",
+            affected_services=[],
+            error_evidence=[],
+            probable_root_cause="Test",
+        )
+
+        # Should return None to trigger deterministic fallback
+        assert result is None
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_api_failure_returns_none_for_fallback(self, mock_post, investigator):
+        """Test that API failures gracefully return None to trigger fallback."""
+        import requests
+        mock_post.side_effect = requests.exceptions.ConnectionError("Network error")
+
+        result = investigator.investigate(
+            incident_summary="Test",
+            affected_services=[],
+            error_evidence=[],
+            probable_root_cause="Test",
+        )
+
+        # Should return None to trigger deterministic fallback
+        assert result is None
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_confidence_field_logged(self, mock_post, investigator):
+        """Test that Sarvam confidence field is recognized and logged."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({
+                            "incident_title": "Test",
+                            "severity": "HIGH",
+                            "summary": "Test",
+                            "probable_root_cause": "Test root cause",
+                            "root_cause_reasoning": "High confidence due to clear evidence",
+                            "supporting_evidence": ["Fact 1"],
+                            "affected_services": ["svc1"],
+                            "failure_propagation": "svc1 → svc2",
+                            "recommended_actions": ["Action 1"],
+                            "confidence": "HIGH",
+                            "uncertainties": []
+                        })
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        }
+        mock_post.return_value = mock_response
+
+        result = investigator.investigate(
+            incident_summary="Test",
+            affected_services=["svc1"],
+            error_evidence=["Fact 1"],
+            probable_root_cause="Root cause",
+        )
+
+        # Should successfully parse and return RCA
+        assert result is not None
+        assert result.incident_title == "Test"
+        # Failure propagation should be appended to uncertainties
+        assert any("svc1 → svc2" in u for u in result.uncertainties)

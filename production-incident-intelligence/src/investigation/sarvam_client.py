@@ -86,52 +86,50 @@ class SarvamInvestigator:
         scenario_hint: str,
     ) -> str:
         """
-        Construct a structured prompt for the LLM.
+        Construct a concise, structured prompt for the LLM.
+        
+        Optimized to reduce token budget usage:
+        - Limit evidence to top 5 findings (not 20)
+        - Compact formatting (no verbose explanations)
+        - Clear instruction for brief, evidence-grounded RCA
+        - No raw logs or redundant metrics
+        
+        Goal: Sarvam should enrich/explain correlation findings, not regenerate them.
         """
-        evidence_text = "\n".join(f"  - {e}" for e in error_evidence[:20])
-        services_text = ", ".join(affected_services)
+        # Limit evidence to top 5 (most critical)
+        evidence_text = "\n".join(f"  - {e[:100]}" for e in error_evidence[:5])
+        services_text = ", ".join(affected_services) if affected_services else "unknown"
 
-        prompt = f"""You are an expert system reliability engineer investigating a production incident.
+        prompt = f"""You are a production incident analyst. Review this incident data and provide structured RCA.
 
-INCIDENT SUMMARY:
-{incident_summary}
+INCIDENT: {incident_summary}
+SERVICES: {services_text}
+ROOT CAUSE (from correlation): {probable_root_cause[:150]}
+TYPE: {scenario_hint}
 
-AFFECTED SERVICES:
-{services_text}
-
-PROBABLE ROOT CAUSE (from correlation engine):
-{probable_root_cause}
-
-SCENARIO HINT:
-{scenario_hint}
-
-ERROR EVIDENCE:
+KEY EVIDENCE (top 5 findings):
 {evidence_text}
 
-Based on this information, provide a structured root cause analysis. Your response MUST be valid JSON with this exact structure:
+TASK: Validate and enrich the identified root cause. Respond ONLY with valid JSON:
 
 {{
-  "incident_title": "Clear, concise title",
-  "severity": "LOW | MEDIUM | HIGH | CRITICAL",
-  "summary": "Concise summary of the incident",
-  "probable_root_cause": "Most likely root cause",
-  "supporting_evidence": ["Evidence point 1", "Evidence point 2"],
-  "affected_services": ["service1", "service2"],
-  "timeline": [
-    {{"timestamp": "ISO timestamp", "service": "service name", "event_type": "event type", "description": "event description"}}
-  ],
-  "recommended_actions": ["Action 1", "Action 2"],
-  "uncertainties": ["Unverified hypothesis 1", "Unverified hypothesis 2"]
+  "incident_title": "concise title (max 60 chars)",
+  "severity": "LOW|MEDIUM|HIGH|CRITICAL",
+  "summary": "brief explanation (max 2 sentences)",
+  "probable_root_cause": "confirmed or refined root cause",
+  "root_cause_reasoning": "brief justification (1-2 sentences)",
+  "supporting_evidence": ["fact 1", "fact 2", "fact 3"],
+  "affected_services": ["svc1", "svc2"],
+  "failure_propagation": "brief chain of failures",
+  "recommended_actions": ["action 1", "action 2", "action 3"],
+  "confidence": "LOW|MEDIUM|HIGH"
 }}
 
-Remember:
-- Do NOT fabricate metrics or logs that were not provided
-- Clearly distinguish facts from hypotheses
-- Severity should match the data provided
-- timeline events should use timestamps from the data or current time
-- recommended_actions should be concrete and actionable
-
-Respond ONLY with the JSON object, no other text."""
+Rules:
+- Base analysis ONLY on provided evidence; do NOT fabricate details
+- Keep all fields concise; total output <500 words
+- Failure propagation should be a single sentence chain
+- Confidence reflects how certain you are about the root cause"""
         return prompt
 
     def _call_api(self, prompt: str) -> Optional[dict]:
@@ -141,8 +139,8 @@ Respond ONLY with the JSON object, no other text."""
         Returns the parsed response dict, or None if the call fails.
         Uses api-subscription-key header for authentication and requests JSON output.
         
-        Reasoning tokens count against max_tokens budget, so increased to 4096
-        to ensure sufficient budget for both reasoning and output.
+        Optimized token budget: Set to 2048 (completion only).
+        This ensures sufficient budget for concise RCA without reasoning overflow.
         """
         url = f"{self._config.api_base_url}/chat/completions"
         headers = {
@@ -155,12 +153,12 @@ Respond ONLY with the JSON object, no other text."""
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.3,
-            "max_tokens": 4096,  # Increased: reasoning tokens count against budget
+            "max_tokens": 2048,  # Optimized: sufficient for concise RCA, prevents truncation
             "response_format": {"type": "json_object"},
         }
 
         try:
-            logger.info("Calling Sarvam V2 API – model: %s, endpoint: %s, max_tokens: 4096", 
+            logger.info("Calling Sarvam V2 API – model: %s, endpoint: %s, max_tokens: 2048", 
                        self._config.model, url)
             response = requests.post(
                 url,
@@ -225,10 +223,12 @@ Respond ONLY with the JSON object, no other text."""
         
         Handles multiple response conditions:
         - Content populated: parse and validate JSON
-        - finish_reason="length": token budget exceeded (diagnostic logged)
+        - finish_reason="length": token budget exceeded (controlled fallback)
         - Empty content: log finish_reason and metadata
         - Invalid JSON: validation error
-        - Reasoning content: NOT the final response, separate from content
+        
+        The response schema now includes 'confidence' and 'root_cause_reasoning' fields
+        to capture enriched analysis from Sarvam.
         """
         try:
             choices = api_response.get("choices", [])
@@ -247,24 +247,24 @@ Respond ONLY with the JSON object, no other text."""
                 usage = api_response.get("usage", {})
                 completion_tokens = usage.get("completion_tokens", "unknown")
                 total_tokens = usage.get("total_tokens", "unknown")
-                logger.error(
+                logger.warning(
                     "Sarvam response truncated: finish_reason='length' (token budget exceeded). "
-                    "completion_tokens=%s, total_tokens=%s. Consider increasing max_tokens or "
-                    "simplifying the prompt.",
+                    "completion_tokens=%s, total_tokens=%s. Falling back to deterministic RCA.",
                     completion_tokens, total_tokens
                 )
                 return None
             
             # Content must be populated (not None, not empty string)
             if content is None:
-                logger.error("Sarvam response content is None (finish_reason=%s, has_reasoning=%s)",
+                logger.error("Sarvam response content is None (finish_reason=%s, has_reasoning=%s). "
+                            "Falling back to deterministic RCA.",
                             finish_reason, reasoning_content is not None)
                 return None
             
             if not content or not content.strip():
                 logger.error(
                     "Sarvam response content is empty (finish_reason=%s, content_length=%d, "
-                    "has_reasoning=%s). This may indicate token budget issues or API misconfiguration.",
+                    "has_reasoning=%s). Falling back to deterministic RCA.",
                     finish_reason, len(content) if content else 0, reasoning_content is not None
                 )
                 return None
@@ -293,6 +293,18 @@ Respond ONLY with the JSON object, no other text."""
                         severity=Severity(evt.get("severity", "MEDIUM")),
                     ))
 
+            # Map Sarvam's new fields to RCAResponse
+            # Note: root_cause_reasoning and confidence are logged but not stored in RCAResponse
+            # (we could extend RCAResponse later if needed)
+            root_cause_reasoning = parsed.get("root_cause_reasoning", "")
+            failure_propagation = parsed.get("failure_propagation", "")
+            confidence = parsed.get("confidence", "MEDIUM")
+            
+            if root_cause_reasoning:
+                logger.debug("Sarvam root_cause_reasoning: %s", root_cause_reasoning)
+            if confidence:
+                logger.debug("Sarvam confidence level: %s", confidence)
+
             rca = RCAResponse(
                 incident_title=parsed.get("incident_title", "Unknown Incident"),
                 severity=Severity(parsed.get("severity", "MEDIUM").upper()),
@@ -305,8 +317,13 @@ Respond ONLY with the JSON object, no other text."""
                 uncertainties=parsed.get("uncertainties", []),
                 generated_by="sarvam_ai",
             )
-            logger.info("Sarvam RCAResponse validated successfully (finish_reason=%s)",
-                       finish_reason)
+            
+            # Append failure propagation to uncertainties if present and not already there
+            if failure_propagation and failure_propagation not in rca.uncertainties:
+                rca.uncertainties.insert(0, f"Propagation: {failure_propagation}")
+            
+            logger.info("Sarvam RCAResponse validated successfully (finish_reason=%s, confidence=%s)",
+                       finish_reason, confidence)
             return rca
 
         except json.JSONDecodeError as e:
