@@ -278,3 +278,182 @@ class TestSarvamIntegration:
         )
 
         assert result is None
+
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_empty_content_with_finish_reason(self, mock_post, investigator):
+        """Test that empty content with diagnostic finish_reason is handled."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "model": "sarvam-105b",
+            "id": "test-id",
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "Some reasoning but no output"
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150
+            }
+        }
+        mock_post.return_value = mock_response
+
+        result = investigator.investigate(
+            incident_summary="Test",
+            affected_services=[],
+            error_evidence=[],
+            probable_root_cause="Test",
+        )
+
+        assert result is None
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_finish_reason_length_token_budget(self, mock_post, investigator):
+        """Test that finish_reason='length' indicates token budget exceeded."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "model": "sarvam-105b",
+            "id": "test-id-length",
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({
+                            "incident_title": "Truncated",
+                            "severity": "HIGH",
+                            "summary": "Incomplete",
+                            "probable_root_cause": "Budget exceeded",
+                            "supporting_evidence": [],
+                            "affected_services": [],
+                            "timeline": [],
+                            "recommended_actions": [],
+                            "uncertainties": [],
+                        })
+                    },
+                    "finish_reason": "length"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 3096,
+                "total_tokens": 4096
+            }
+        }
+        mock_post.return_value = mock_response
+
+        result = investigator.investigate(
+            incident_summary="Test",
+            affected_services=[],
+            error_evidence=[],
+            probable_root_cause="Test",
+        )
+
+        assert result is None
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_content_null(self, mock_post, investigator):
+        """Test that null content is handled."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None
+                    },
+                    "finish_reason": "stop"
+                }
+            ]
+        }
+        mock_post.return_value = mock_response
+
+        result = investigator.investigate(
+            incident_summary="Test",
+            affected_services=[],
+            error_evidence=[],
+            probable_root_cause="Test",
+        )
+
+        assert result is None
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_max_tokens_4096(self, mock_post, investigator):
+        """Test that max_tokens is 4096."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({
+                            "incident_title": "Test",
+                            "severity": "MEDIUM",
+                            "summary": "Test",
+                            "probable_root_cause": "Test",
+                            "supporting_evidence": [],
+                            "affected_services": [],
+                            "timeline": [],
+                            "recommended_actions": [],
+                            "uncertainties": [],
+                        })
+                    }
+                }
+            ]
+        }
+        mock_post.return_value = mock_response
+
+        investigator.investigate("Summary", [], [], "Root cause")
+
+        call_kwargs = mock_post.call_args[1]
+        payload = call_kwargs["json"]
+
+        assert payload["max_tokens"] == 4096
+
+    @patch("src.investigation.sarvam_client.requests.post")
+    def test_sarvam_reasoning_content_not_in_response(self, mock_post, investigator):
+        """Test that reasoning_content is not mistaken for output."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "model": "sarvam-105b",
+            "id": "test-reasoning",
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps({
+                            "incident_title": "Final Response",
+                            "severity": "HIGH",
+                            "summary": "Actual response",
+                            "probable_root_cause": "Root cause",
+                            "supporting_evidence": ["Evidence"],
+                            "affected_services": ["service1"],
+                            "timeline": [],
+                            "recommended_actions": ["Action"],
+                            "uncertainties": [],
+                        }),
+                        "reasoning_content": "Internal reasoning not for user..."
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 800,
+                "total_tokens": 1300
+            }
+        }
+        mock_post.return_value = mock_response
+
+        result = investigator.investigate(
+            incident_summary="Test",
+            affected_services=["service1"],
+            error_evidence=["Error"],
+            probable_root_cause="Root cause",
+        )
+
+        assert result is not None
+        assert result.incident_title == "Final Response"
+        assert result.summary == "Actual response"
